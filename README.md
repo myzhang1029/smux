@@ -1,8 +1,8 @@
-# async-smux
+# smux
 
-[crates.io](https://crates.io/crates/async_smux)
+[crates.io](https://crates.io/crates/smux)
 
-A lightweight asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for smol/async-std and any async runtime compatible to `futures`.
+A lightweight asynchronous [smux](https://github.com/xtaci/smux) (Simple MUltipleXing) library for Rust.
 
 ![img](https://raw.githubusercontent.com/xtaci/smux/master/mux.jpg)
 
