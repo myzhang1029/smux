@@ -1,14 +1,17 @@
 [package]
-name = "async_smux"
-version = "0.2.1"
-authors = ["black-binary <blackbinary@qq.com>"]
+name = "smux"
+version = "0.3.0"
+authors = ["black-binary <blackbinary@qq.com>", "Zhang Maiyun <me@myzhangll.xyz"]
 description = "Asynchronous smux multiplexing library"
 license = "MIT"
 edition = "2021"
+repository = "https://github.com/myzhang1029/smux"
+keywords = ["smux", "multiplexing", "async"]
+categories = ["asynchronous", "network-programming"]
 
 [dependencies]
 futures = "0.3"
-tokio = { version = "1", features = ["io-util", "sync"] }
+tokio = { version = "1", features = ["io-util", "macros", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1.2"
 rand = "0.8"
@@ -23,10 +26,3 @@ tokio = { version = "1", features = ["full"] }
 env_logger = "0.9"
 criterion = "0.4"
 pprof = { version = "0.10", features = ["flamegraph"] } 
-
-[profile.release]
-debug = true
-
-#[[bench]]
-#name = "smol"
-#harness = false
