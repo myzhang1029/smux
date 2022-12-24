@@ -6,17 +6,21 @@ use crate::{
     mux_connection, MuxAcceptor, MuxConnector,
 };
 
+#[derive(Clone, Debug)]
 pub struct WithConnection<T> {
     config: MuxConfig,
     connection: T,
 }
 
+#[derive(Clone, Debug)]
 pub struct WithConfig {
     config: MuxConfig,
 }
 
+#[derive(Clone, Debug)]
 pub struct Begin {}
 
+#[derive(Clone, Debug)]
 pub struct MuxBuilder<State> {
     state: State,
 }
