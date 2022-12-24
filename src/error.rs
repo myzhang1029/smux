@@ -2,8 +2,9 @@ use thiserror::Error;
 
 use crate::config::StreamIdType;
 
+/// Error type for `smux`.
 #[derive(Debug, Error)]
-pub enum MuxError {
+pub enum Error {
     #[error("Invalid command {0}")]
     InvalidCommand(u8),
     #[error("Invalid version {0}")]
@@ -16,8 +17,8 @@ pub enum MuxError {
     #[error("Invalid stream ID from peer: {0}, local stream ID type: {0:?}")]
     InvalidPeerStreamIdType(u32, StreamIdType),
 
-    #[error("Too many streams")]
-    TooManyStreams,
+    #[error("Too many channels")]
+    TooManyChannels,
 
     #[error("Inner connection closed")]
     ConnectionClosed,
@@ -28,4 +29,5 @@ pub enum MuxError {
     IoError(#[from] std::io::Error),
 }
 
-pub type MuxResult<T> = Result<T, MuxError>;
+/// `Result` whose error type is `smux::Error`.
+pub type Result<T> = std::result::Result<T, Error>;

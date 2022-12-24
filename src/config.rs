@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::{fmt::Display, num::NonZeroU64};
 
 #[derive(Clone, Copy, Debug, Hash, Ord, PartialOrd, PartialEq, Eq)]
 pub enum StreamIdType {
@@ -6,6 +6,16 @@ pub enum StreamIdType {
     Odd = 1,
 }
 
+impl Display for StreamIdType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamIdType::Even => write!(f, "server"),
+            StreamIdType::Odd => write!(f, "client"),
+        }
+    }
+}
+
+/// Mux configuration.
 #[derive(Clone, Copy, Debug, Hash, Ord, PartialOrd, PartialEq, Eq)]
 pub struct MuxConfig {
     pub stream_id_type: StreamIdType,

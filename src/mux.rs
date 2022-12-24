@@ -1,23 +1,22 @@
 use std::{
     collections::{HashMap, VecDeque},
     io::ErrorKind,
-    num::Wrapping,
+    num::{NonZeroU64, Wrapping},
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex, MutexGuard, TryLockError,
     },
     task::{Context, Poll, Waker},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::{Buf, Bytes};
-use futures::{ready, Future, FutureExt, SinkExt, Stream, StreamExt};
-use futures_sink::Sink;
-use parking_lot::Mutex;
-use std::io as StdIo;
+use futures::{ready, Future, FutureExt, Sink, SinkExt, Stream, StreamExt};
+use log::{debug, trace};
+use std::io;
 use tokio::{
-    io::{self, AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     macros::support::poll_fn,
     time::{interval, Interval},
 };
@@ -25,42 +24,41 @@ use tokio_util::codec::Framed;
 
 use crate::{
     config::{MuxConfig, StreamIdType},
-    error::{MuxError, MuxResult},
     frame::{MuxCodec, MuxCommand, MuxFrame, MAX_PAYLOAD_SIZE},
+    {Error, Result},
 };
 
-pub trait TokioConn: AsyncRead + AsyncWrite + Unpin {}
+pub trait TokioConn: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
-impl<T> TokioConn for T where T: AsyncRead + AsyncWrite + Unpin {}
+impl<T> TokioConn for T where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
-pub fn mux_connection<T: TokioConn>(
-    connection: T,
-    config: MuxConfig,
-) -> (MuxConnector<T>, MuxAcceptor<T>, MuxWorker<T>) {
-    let timestamp = Arc::new(AtomicU64::new(get_timestamp_slow()));
-    let inner = Framed::new(connection, MuxCodec {});
-    let state = Arc::new(Mutex::new(MuxState {
-        inner,
-        handles: HashMap::new(),
-        accept_queue: VecDeque::new(),
-        accept_waker: None,
-        accpet_closed: false,
-        tx_queue: VecDeque::new(),
-        tx_waker: None,
-        tx_closed: false,
-        rx_closed: false,
-        stream_id_hint: Wrapping(config.stream_id_type as u32),
-        stream_id_type: config.stream_id_type,
-        timestamp: timestamp.clone(),
-    }));
-    (
-        MuxConnector {
-            state: state.clone(),
-        },
-        MuxAcceptor {
-            state: state.clone(),
-        },
-        MuxWorker {
+/// The mutiplexor.
+pub struct Mux<T: TokioConn> {
+    state: Arc<Mutex<MuxState<T>>>,
+    worker_task: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl<T: TokioConn> Mux<T> {
+    /// Create a new mux from any stream that implements `AsyncRead` and `AsyncWrite`.
+    pub async fn from_connection(connection: T, config: MuxConfig) -> Self {
+        let timestamp = Arc::new(AtomicU64::new(get_timestamp_slow()));
+        let inner = Framed::new(connection, MuxCodec {});
+        let state = Arc::new(Mutex::new(MuxState {
+            inner,
+            handles: HashMap::new(),
+            accept_queue: VecDeque::new(),
+            accept_waker: None,
+            accept_closed: false,
+            tx_queue: VecDeque::new(),
+            tx_waker: None,
+            tx_closed: false,
+            rx_closed: false,
+            stream_id_hint: Wrapping(config.stream_id_type as u32),
+            stream_id_type: config.stream_id_type,
+            timestamp: timestamp.clone(),
+        }));
+
+        let worker = MuxWorker {
             dispatcher: MuxDispatcher {
                 state: state.clone(),
             },
@@ -68,25 +66,45 @@ pub fn mux_connection<T: TokioConn>(
                 state: state.clone(),
             },
             timer: MuxTimer {
-                state,
+                state: state.clone(),
                 interval: interval(Duration::from_millis(500)),
                 timestamp,
                 last_ping: get_timestamp_slow(),
-                keep_alive_interval: config.keep_alive_interval.map(|a| a.get()),
-                idle_timeout: config.idle_timeout.map(|a| a.get()),
+                keep_alive_interval: config.keep_alive_interval.map(NonZeroU64::get),
+                idle_timeout: config.idle_timeout.map(NonZeroU64::get),
             },
-        },
-    )
-}
+        };
 
-#[derive(Clone)]
-pub struct MuxConnector<T: TokioConn> {
-    state: Arc<Mutex<MuxState<T>>>,
-}
+        Mux {
+            state,
+            worker_task: Self::spawn_worker(worker).await,
+        }
+    }
 
-impl<T: TokioConn> MuxConnector<T> {
-    pub fn connect(&self) -> MuxResult<MuxStream<T>> {
-        let mut state = self.state.lock();
+    /// Spawn the worker. For internal use only.
+    async fn spawn_worker(worker: MuxWorker<T>) -> tokio::task::JoinHandle<Result<()>> {
+        trace!("Spawning worker");
+        tokio::spawn(async move { worker.await })
+    }
+
+    // These two methods were in the `connector`.
+
+    /// Connect to a new channel.
+    /// This method completes instantly, but subsequent read will block until the other end accepts.
+    ///
+    /// # Errors
+    /// Returns `Error::ConnectionClosed` if the mux is already closed.
+    /// Returns `Error::TooManyChannels` if the number of channels exceeds the limit.
+    /// Returns `Error::InvalidPeerStreamIdType` if the peer has the same type (client or server).
+    /// Returns `Error::DuplicatedStreamId` if the stream ID is already used (should not happen).
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn connect(&self) -> Result<MuxStream<T>> {
+        // `unwrap` is safe because Err only happens when another thread panicked,
+        // which should never happen.
+        let mut state = self.state.lock().unwrap();
+        debug!("Connecting to a new channel");
         state.check_tx_closed()?;
 
         let stream_id = state.alloc_stream_id()?;
@@ -103,26 +121,78 @@ impl<T: TokioConn> MuxConnector<T> {
         Ok(stream)
     }
 
-    pub fn get_num_streams(&self) -> usize {
-        self.state.lock().handles.len()
+    /// Get the number of streams already connected.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn get_num_channels(&self) -> usize {
+        let result = self.state.lock().unwrap().handles.len();
+        debug!("Number of channels: {result}");
+        result
+    }
+
+    // These two methods were in the `acceptor`.
+
+    /// Accept a new channel from the other end.
+    pub async fn accept(&mut self) -> Option<MuxStream<T>> {
+        let result = self.next().await;
+        debug!("Accepted a new channel");
+        result
+    }
+
+    /// Close and drop the mux.
+    ///
+    /// # Errors
+    /// Returns decoder errors.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub async fn close(self) -> Result<()> {
+        poll_fn(|cx| {
+            let mut state = self.state.lock().unwrap();
+            state.inner.poll_close_unpin(cx)
+        })
+        .await?;
+        debug!("Mux closed");
+        Ok(())
     }
 }
 
-pub struct MuxAcceptor<T: TokioConn> {
-    state: Arc<Mutex<MuxState<T>>>,
-}
-
-impl<T: TokioConn> Drop for MuxAcceptor<T> {
+impl<T: TokioConn> Drop for Mux<T> {
     fn drop(&mut self) {
-        self.state.lock().accpet_closed = true;
+        let mut state = self.state.lock().unwrap();
+        state.accept_closed = true;
+        state.close_rx();
+        state.close_tx();
+        self.worker_task.abort();
     }
 }
 
-impl<T: TokioConn> Stream for MuxAcceptor<T> {
+/// Lock a mutex, or return `Pending` if the mutex is occupied.
+///
+/// # Panics
+/// Panics if the mutex is poisoned.
+fn lock_mutex_or_pending<'mutex, T>(
+    mutex: &'mutex Mutex<T>,
+    cx: &mut Context<'_>,
+) -> Poll<MutexGuard<'mutex, T>> {
+    match mutex.try_lock() {
+        Ok(guard) => Poll::Ready(guard),
+        Err(TryLockError::WouldBlock) => {
+            trace!("Mutex is occupied");
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+        Err(TryLockError::Poisoned(e)) => panic!("Poisoned mutex: {e}"),
+    }
+}
+
+impl<T: TokioConn> Stream for Mux<T> {
     type Item = MuxStream<T>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut state = self.state.lock();
+        let mut state = ready!(lock_mutex_or_pending(&self.state, cx));
         if state.check_rx_closed().is_err() {
             return Poll::Ready(None);
         }
@@ -133,27 +203,6 @@ impl<T: TokioConn> Stream for MuxAcceptor<T> {
             state.register_accept_waker(cx);
             Poll::Pending
         }
-    }
-}
-
-impl<T: TokioConn> MuxAcceptor<T> {
-    pub async fn accept(&mut self) -> Option<MuxStream<T>> {
-        self.next().await
-    }
-
-    pub fn get_num_streams(&mut self) -> usize {
-        self.state.lock().handles.len()
-    }
-
-    pub async fn close(&mut self) -> MuxResult<()> {
-        poll_fn(|cx| {
-            let mut state = self.state.lock();
-            state.close_tx();
-            state.close_rx();
-            state.inner.poll_close_unpin(cx)
-        })
-        .await?;
-        Ok(())
     }
 }
 
@@ -177,7 +226,7 @@ struct MuxTimer<T: TokioConn> {
 }
 
 impl<T: TokioConn> Future for MuxTimer<T> {
-    type Output = MuxResult<()>;
+    type Output = Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
@@ -186,11 +235,12 @@ impl<T: TokioConn> Future for MuxTimer<T> {
 
             let ts = get_timestamp_slow();
             self.timestamp.store(ts, Ordering::SeqCst);
-            let mut state = self.state.lock();
+            let mut state = ready!(lock_mutex_or_pending(&self.state, cx));
 
             // Ping
             if let Some(keep_alive_interval) = self.keep_alive_interval {
                 if ts > self.last_ping + keep_alive_interval {
+                    trace!("Sending ping");
                     state.enqueue_frame_global(MuxFrame::new(MuxCommand::Nop, 0, Bytes::new()));
                     state.wake_tx();
                 }
@@ -224,13 +274,16 @@ struct MuxSender<T: TokioConn> {
 }
 
 impl<T: TokioConn> Future for MuxSender<T> {
-    type Output = MuxResult<()>;
+    type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            let mut state = self.state.lock();
+            let mut state = ready!(lock_mutex_or_pending(&self.state, cx));
+            trace!("{} Polling flush_frames", state.stream_id_type);
             ready!(state.poll_flush_frames(cx))?;
+            trace!("{} Polling flush_inner", state.stream_id_type);
             ready!(state.poll_flush_inner(cx))?;
+            trace!("{} Polling ready_tx", state.stream_id_type);
             ready!(state.poll_ready_tx(cx))?;
         }
     }
@@ -238,7 +291,8 @@ impl<T: TokioConn> Future for MuxSender<T> {
 
 impl<T: TokioConn> Drop for MuxSender<T> {
     fn drop(&mut self) {
-        self.state.lock().close_tx();
+        debug!("MuxSender dropped");
+        self.state.lock().unwrap().close_tx();
     }
 }
 
@@ -248,24 +302,27 @@ struct MuxDispatcher<T: TokioConn> {
 
 impl<T: TokioConn> Drop for MuxDispatcher<T> {
     fn drop(&mut self) {
-        self.state.lock().close_rx();
+        debug!("MuxDispatcher dropped");
+        self.state.lock().unwrap().close_rx();
     }
 }
 
 impl<T: TokioConn> Future for MuxDispatcher<T> {
-    type Output = MuxResult<()>;
+    type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            let mut state = self.state.lock();
+            let mut state = ready!(lock_mutex_or_pending(&self.state, cx));
             if state.rx_closed {
                 return Poll::Ready(Ok(()));
             }
 
+            trace!("{} Polling next_frame", state.stream_id_type);
             let frame = ready!(state.poll_next_frame(cx))?;
             match frame.header.command {
                 MuxCommand::Sync => {
-                    if state.accpet_closed {
+                    trace!("Received SYN frame");
+                    if state.accept_closed {
                         state.send_finish(frame.header.stream_id);
                         continue;
                     }
@@ -281,15 +338,18 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
                     state.wake_accept();
                 }
                 MuxCommand::Finish => {
+                    trace!("Received FIN frame");
                     state.process_finish(frame.header.stream_id);
                 }
                 MuxCommand::Push => {
+                    trace!("Received PSH frame");
                     let stream_id = frame.header.stream_id;
                     if !state.process_push(frame) {
                         state.send_finish(stream_id);
                     }
                 }
                 MuxCommand::Nop => {
+                    trace!("Received NOP frame");
                     // Do nothing
                 }
             }
@@ -297,22 +357,26 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
     }
 }
 
-pub struct MuxWorker<T: TokioConn> {
+/// Background worker for Mux that pumps frames from the underlying connection.
+struct MuxWorker<T: TokioConn> {
     dispatcher: MuxDispatcher<T>,
     sender: MuxSender<T>,
     timer: MuxTimer<T>,
 }
 
 impl<T: TokioConn> Future for MuxWorker<T> {
-    type Output = MuxResult<()>;
+    type Output = Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        trace!("Polling sender");
         if self.sender.poll_unpin(cx)?.is_ready() {
             return Poll::Ready(Ok(()));
         }
+        trace!("Polling timer");
         if self.timer.poll_unpin(cx)?.is_ready() {
             return Poll::Ready(Ok(()));
         }
+        trace!("Polling dispatcher");
         if self.dispatcher.poll_unpin(cx)?.is_ready() {
             return Poll::Ready(Ok(()));
         }
@@ -329,7 +393,8 @@ pub struct MuxStream<T: TokioConn> {
 
 impl<T: TokioConn> Drop for MuxStream<T> {
     fn drop(&mut self) {
-        let mut state = self.state.lock();
+        debug!("MuxStream dropped");
+        let mut state = self.state.lock().unwrap();
         if state.is_open(self.stream_id) {
             // The user did not call `shutdown()`
             state.enqueue_frame_global(MuxFrame::new(
@@ -347,10 +412,12 @@ impl<T: TokioConn> AsyncRead for MuxStream<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut io::ReadBuf<'_>,
-    ) -> Poll<StdIo::Result<()>> {
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        trace!("poll_read called");
         loop {
             if let Some(read_buffer) = &mut self.read_buffer {
+                trace!("Dealing with read buffer");
                 if read_buffer.len() <= buf.remaining() {
                     buf.put_slice(read_buffer);
                     self.read_buffer = None;
@@ -362,27 +429,34 @@ impl<T: TokioConn> AsyncRead for MuxStream<T> {
                 return Poll::Ready(Ok(()));
             }
 
-            let frame = ready!(self.state.lock().poll_read_stream_data(cx, self.stream_id))
-                .map_err(mux_to_io_err)?;
+            let mut state = ready!(lock_mutex_or_pending(&self.state, cx));
+            trace!(
+                "{} Stream {} polling read_stream_data",
+                state.stream_id_type,
+                self.stream_id
+            );
+            let frame =
+                ready!(state.poll_read_stream_data(cx, self.stream_id)).map_err(mux_to_io_err)?;
+            drop(state);
             debug_assert_eq!(frame.header.command, MuxCommand::Push);
             self.read_buffer = Some(frame.payload);
         }
     }
 }
 
-fn mux_to_io_err(e: MuxError) -> StdIo::Error {
-    StdIo::Error::new(ErrorKind::Other, e)
+fn mux_to_io_err(e: Error) -> io::Error {
+    io::Error::new(ErrorKind::Other, e)
 }
 
 impl<T: TokioConn> AsyncWrite for MuxStream<T> {
     fn poll_write(
         self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, StdIo::Error>> {
-        let mut state = self.state.lock();
+    ) -> Poll<io::Result<usize>> {
+        let mut state = ready!(lock_mutex_or_pending(&self.state, cx));
         if !state.is_open(self.stream_id) {
-            return Poll::Ready(Err(StdIo::ErrorKind::ConnectionReset.into()));
+            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
         }
 
         let mut write_buffer = Bytes::copy_from_slice(buf);
@@ -396,10 +470,10 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), StdIo::Error>> {
-        let mut state = self.state.lock();
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut state = ready!(lock_mutex_or_pending(&self.state, cx));
         if !state.is_open(self.stream_id) {
-            return Poll::Ready(Err(StdIo::Error::new(
+            return Poll::Ready(Err(io::Error::new(
                 ErrorKind::ConnectionReset,
                 "stream is already closed",
             )));
@@ -410,9 +484,9 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
             .map_err(mux_to_io_err)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), StdIo::Error>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
-            let mut state = self.state.lock();
+            let mut state = ready!(lock_mutex_or_pending(&self.state, cx));
             state.check_tx_closed().map_err(mux_to_io_err)?;
             ready!(state
                 .poll_flush_stream_frames(cx, self.stream_id)
@@ -428,8 +502,12 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
 }
 
 impl<T: TokioConn> MuxStream<T> {
+    /// Checks if the stream is closed.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
     pub fn is_closed(&mut self) -> bool {
-        !self.state.lock().is_open(self.stream_id)
+        !self.state.lock().unwrap().is_open(self.stream_id)
     }
 }
 
@@ -471,6 +549,8 @@ impl StreamHandle {
     fn wake_rx(&mut self) {
         if let Some(waker) = self.rx_waker.take() {
             waker.wake();
+        } else {
+            trace!("No waker to wake for rx");
         }
     }
 
@@ -478,6 +558,8 @@ impl StreamHandle {
     fn wake_tx(&mut self) {
         if let Some(waker) = self.tx_waker.take() {
             waker.wake();
+        } else {
+            trace!("No waker to wake for tx");
         }
     }
 }
@@ -488,7 +570,7 @@ struct MuxState<T: TokioConn> {
 
     accept_queue: VecDeque<MuxStream<T>>,
     accept_waker: Option<Waker>,
-    accpet_closed: bool,
+    accept_closed: bool,
 
     tx_queue: VecDeque<MuxFrame>,
     tx_waker: Option<Waker>,
@@ -503,9 +585,9 @@ struct MuxState<T: TokioConn> {
 }
 
 impl<T: TokioConn> MuxState<T> {
-    fn alloc_stream_id(&mut self) -> MuxResult<u32> {
+    fn alloc_stream_id(&mut self) -> Result<u32> {
         if self.handles.len() >= (u32::MAX / 2) as usize {
-            return Err(MuxError::TooManyStreams);
+            return Err(Error::TooManyChannels);
         }
 
         while self.handles.contains_key(&self.stream_id_hint.0) {
@@ -526,13 +608,13 @@ impl<T: TokioConn> MuxState<T> {
         self.wake_tx();
     }
 
-    fn process_sync(&mut self, stream_id: u32, from_peer: bool) -> MuxResult<()> {
+    fn process_sync(&mut self, stream_id: u32, from_peer: bool) -> Result<()> {
         if self.handles.contains_key(&stream_id) {
-            return Err(MuxError::DuplicatedStreamId(stream_id));
+            return Err(Error::DuplicatedStreamId(stream_id));
         }
 
-        if (stream_id % 2 != self.stream_id_type as _) ^ from_peer {
-            return Err(MuxError::InvalidPeerStreamIdType(
+        if (stream_id % 2 != self.stream_id_type as u32) ^ from_peer {
+            return Err(Error::InvalidPeerStreamIdType(
                 stream_id,
                 self.stream_id_type,
             ));
@@ -571,9 +653,9 @@ impl<T: TokioConn> MuxState<T> {
         }
     }
 
-    fn poll_next_frame(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<MuxFrame>> {
+    fn poll_next_frame(&mut self, cx: &mut Context<'_>) -> Poll<Result<MuxFrame>> {
         if self.rx_closed {
-            return Poll::Ready(Err(MuxError::ConnectionClosed));
+            return Poll::Ready(Err(Error::ConnectionClosed));
         }
 
         if let Some(r) = ready!(self.inner.poll_next_unpin(cx)) {
@@ -584,7 +666,7 @@ impl<T: TokioConn> MuxState<T> {
             Poll::Ready(Ok(frame))
         } else {
             self.rx_closed = true;
-            Poll::Ready(Err(MuxError::ConnectionClosed))
+            Poll::Ready(Err(Error::ConnectionClosed))
         }
     }
 
@@ -593,7 +675,7 @@ impl<T: TokioConn> MuxState<T> {
         Pin::new(&mut self.inner)
     }
 
-    fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
+    fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         ready!(self.pin_inner().poll_ready(cx)).map_err(|e| {
             self.tx_closed = true;
             e
@@ -601,7 +683,7 @@ impl<T: TokioConn> MuxState<T> {
         Poll::Ready(Ok(()))
     }
 
-    fn write_frame(&mut self, frame: MuxFrame) -> MuxResult<()> {
+    fn write_frame(&mut self, frame: MuxFrame) -> Result<()> {
         self.pin_inner().start_send(frame)?;
         Ok(())
     }
@@ -610,13 +692,14 @@ impl<T: TokioConn> MuxState<T> {
         &mut self,
         cx: &mut Context<'_>,
         stream_id: u32,
-    ) -> Poll<MuxResult<MuxFrame>> {
+    ) -> Poll<Result<MuxFrame>> {
         let handle = self.handles.get_mut(&stream_id).unwrap();
         if let Some(f) = handle.rx_queue.pop_front() {
             Poll::Ready(Ok(f))
         } else if handle.closed {
-            Poll::Ready(Err(MuxError::StreamClosed(stream_id)))
+            Poll::Ready(Err(Error::StreamClosed(stream_id)))
         } else {
+            trace!("poll_read_stream_data: register waker");
             handle.register_rx_waker(cx);
             Poll::Pending
         }
@@ -655,7 +738,7 @@ impl<T: TokioConn> MuxState<T> {
         &mut self,
         cx: &mut Context<'_>,
         stream_id: u32,
-    ) -> Poll<MuxResult<()>> {
+    ) -> Poll<Result<()>> {
         let handle = self.handles.get_mut(&stream_id).unwrap();
         if handle.tx_queue.is_empty() {
             Poll::Ready(Ok(()))
@@ -680,8 +763,10 @@ impl<T: TokioConn> MuxState<T> {
 
     fn close_tx(&mut self) {
         self.tx_closed = true;
-        for (_, handle) in self.handles.iter_mut() {
+        self.wake_tx();
+        for (id, handle) in &mut self.handles {
             handle.closed = true;
+            trace!("close_tx: wake tx id={id}");
             handle.wake_tx();
         }
     }
@@ -689,29 +774,30 @@ impl<T: TokioConn> MuxState<T> {
     fn close_rx(&mut self) {
         self.rx_closed = true;
         self.wake_accept();
-        for (_, handle) in self.handles.iter_mut() {
+        for (id, handle) in &mut self.handles {
             handle.closed = true;
+            trace!("close_rx: wake rx id={id}");
             handle.wake_rx();
         }
     }
 
-    fn check_rx_closed(&self) -> MuxResult<()> {
+    fn check_rx_closed(&self) -> Result<()> {
         if self.tx_closed {
-            Err(MuxError::ConnectionClosed)
+            Err(Error::ConnectionClosed)
         } else {
             Ok(())
         }
     }
 
-    fn check_tx_closed(&self) -> MuxResult<()> {
+    fn check_tx_closed(&self) -> Result<()> {
         if self.tx_closed {
-            Err(MuxError::ConnectionClosed)
+            Err(Error::ConnectionClosed)
         } else {
             Ok(())
         }
     }
 
-    fn poll_flush_frames(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
+    fn poll_flush_frames(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         // Global
         while !self.tx_queue.is_empty() {
             ready!(self.poll_write_ready(cx))?;
@@ -735,13 +821,13 @@ impl<T: TokioConn> MuxState<T> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
+    fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.inner.poll_flush_unpin(cx)
     }
 
-    fn poll_ready_tx(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<()>> {
+    fn poll_ready_tx(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.tx_closed {
-            return Poll::Ready(Err(MuxError::ConnectionClosed));
+            return Poll::Ready(Err(Error::ConnectionClosed));
         }
 
         if self.tx_queue.is_empty() && self.handles.iter().all(|(_, h)| h.tx_queue.is_empty()) {

@@ -3,11 +3,12 @@ use tokio_util::codec::{Decoder, Encoder};
 
 use std::io::Cursor;
 
-use crate::error::{MuxError, MuxResult};
+use crate::{Error, Result};
 
 pub const SMUX_VERSION: u8 = 1;
 pub const HEADER_SIZE: usize = 8;
-pub const MAX_PAYLOAD_SIZE: usize = 0xffff;
+// Max of u16
+pub const MAX_PAYLOAD_SIZE: usize = u16::MAX as usize;
 
 #[derive(Eq, PartialEq, Debug, Clone, Copy)]
 pub(crate) enum MuxCommand {
@@ -18,15 +19,15 @@ pub(crate) enum MuxCommand {
 }
 
 impl TryFrom<u8> for MuxCommand {
-    type Error = MuxError;
+    type Error = Error;
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
+    fn try_from(value: u8) -> Result<Self> {
         match value {
             0 => Ok(MuxCommand::Sync),
             1 => Ok(MuxCommand::Finish),
             2 => Ok(MuxCommand::Push),
             3 => Ok(MuxCommand::Nop),
-            _ => Err(MuxError::InvalidCommand(value)),
+            _ => Err(Error::InvalidCommand(value)),
         }
     }
 }
@@ -41,7 +42,7 @@ pub(crate) struct MuxFrameHeader {
 
 impl MuxFrameHeader {
     #[inline]
-    fn encode(&self, buf: &mut BytesMut) {
+    fn encode(self, buf: &mut BytesMut) {
         buf.put_u8(self.version);
         buf.put_u8(self.command as u8);
         buf.put_u16(self.length);
@@ -49,11 +50,11 @@ impl MuxFrameHeader {
     }
 
     #[inline]
-    fn decode(buf: &[u8]) -> MuxResult<Self> {
+    fn decode(buf: &[u8]) -> Result<Self> {
         let mut cursor = Cursor::new(buf);
         let version = cursor.get_u8();
         if version != SMUX_VERSION {
-            return Err(MuxError::InvalidVersion(version));
+            return Err(Error::InvalidVersion(version));
         }
         let command = MuxCommand::try_from(cursor.get_u8())?;
         let length = cursor.get_u16();
@@ -80,7 +81,8 @@ impl MuxFrame {
             header: MuxFrameHeader {
                 version: SMUX_VERSION,
                 command,
-                length: payload.len() as u16,
+                // Make sure the payload length is less than MAX_PAYLOAD_SIZE
+                length: u16::try_from(payload.len()).unwrap(),
                 stream_id,
             },
             payload,
@@ -92,9 +94,9 @@ pub(crate) struct MuxCodec {}
 
 impl Decoder for MuxCodec {
     type Item = MuxFrame;
-    type Error = MuxError;
+    type Error = Error;
 
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         if src.len() < HEADER_SIZE {
             return Ok(None);
         }
@@ -114,15 +116,15 @@ impl Decoder for MuxCodec {
 }
 
 impl Encoder<MuxFrame> for MuxCodec {
-    type Error = MuxError;
+    type Error = Error;
 
-    fn encode(&mut self, item: MuxFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: MuxFrame, dst: &mut BytesMut) -> Result<()> {
         if item.header.version != SMUX_VERSION {
-            return Err(MuxError::InvalidVersion(item.header.version));
+            return Err(Error::InvalidVersion(item.header.version));
         }
 
         if item.payload.len() > MAX_PAYLOAD_SIZE {
-            return Err(MuxError::PayloadTooLarge(item.payload.len()));
+            return Err(Error::PayloadTooLarge(item.payload.len()));
         }
 
         item.header.encode(dst);

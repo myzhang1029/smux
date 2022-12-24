@@ -1,6 +1,6 @@
 [package]
 name = "smux"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["black-binary <blackbinary@qq.com>", "Zhang Maiyun <me@myzhangll.xyz"]
 description = "Asynchronous smux multiplexing library"
 license = "MIT"
@@ -10,19 +10,14 @@ keywords = ["smux", "multiplexing", "async"]
 categories = ["asynchronous", "network-programming"]
 
 [dependencies]
+bytes = "1"
 futures = "0.3"
-tokio = { version = "1", features = ["io-util", "macros", "time"] }
-tokio-util = { version = "0.7", features = ["codec"] }
-bytes = "1.2"
-rand = "0.8"
 log = "0.4"
-parking_lot = "0.12"
-pin-project = "1.0"
-thiserror = "1.0"
-futures-sink = "0.3"
+rand = "0.8"
+thiserror = "1"
+tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 
 [dev-dependencies]
+env_logger = "0.10"
 tokio = { version = "1", features = ["full"] }
-env_logger = "0.9"
-criterion = "0.4"
-pprof = { version = "0.10", features = ["flamegraph"] } 

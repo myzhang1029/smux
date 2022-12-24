@@ -3,12 +3,13 @@
 pub mod builder;
 pub mod config;
 pub mod error;
-pub(crate) mod frame;
-pub(crate) mod mux;
+mod frame;
+mod mux;
 
-pub use builder::MuxBuilder;
+pub use builder::Builder as MuxBuilder;
 pub use config::{MuxConfig, StreamIdType};
-pub use mux::{mux_connection, MuxAcceptor, MuxConnector, MuxStream};
+pub use error::{Error, Result};
+pub use mux::{Mux, MuxStream};
 
 #[cfg(test)]
 mod tests {
@@ -16,11 +17,13 @@ mod tests {
 
     use rand::RngCore;
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{duplex, AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
     };
 
-    use crate::{builder::MuxBuilder, frame::MAX_PAYLOAD_SIZE, mux::TokioConn, MuxStream};
+    use crate::{
+        builder::Builder as MuxBuilder, frame::MAX_PAYLOAD_SIZE, mux::TokioConn, MuxStream,
+    };
 
     async fn get_tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -72,153 +75,88 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_tcp() {
-        let (a, b) = get_tcp_pair().await;
-        let (connector_a, mut acceptor_a, worker_a) =
-            MuxBuilder::client().with_connection(a).build();
-        let (connector_b, mut acceptor_b, worker_b) =
-            MuxBuilder::server().with_connection(b).build();
-        tokio::spawn(async move {
-            worker_a.await.unwrap();
-        });
-        tokio::spawn(async move {
-            worker_b.await.unwrap();
-        });
+    async fn test_mux() {
+        let (a, b) = duplex(0x8000);
+        let mut mux_a = MuxBuilder::new_client().build(a).await;
+        let mut mux_b = MuxBuilder::new_server().build(b).await;
 
-        let stream1 = connector_a.connect().unwrap();
-        let stream2 = acceptor_b.accept().await.unwrap();
+        let stream1 = mux_a.connect().unwrap();
+        let stream2 = mux_b.accept().await.unwrap();
         test_stream(stream1, stream2).await;
 
-        let stream1 = connector_b.connect().unwrap();
-        let stream2 = acceptor_a.accept().await.unwrap();
+        let stream1 = mux_b.connect().unwrap();
+        let stream2 = mux_a.accept().await.unwrap();
         test_stream(stream1, stream2).await;
 
-        assert_eq!(connector_a.get_num_streams(), 0);
-        assert_eq!(connector_b.get_num_streams(), 0);
-        assert_eq!(acceptor_a.get_num_streams(), 0);
-        assert_eq!(acceptor_b.get_num_streams(), 0);
+        assert_eq!(mux_a.get_num_channels(), 0);
+        assert_eq!(mux_b.get_num_channels(), 0);
 
-        let mut streams1 = vec![];
-        let mut streams2 = vec![];
         const STREAM_NUM: usize = 0x1000;
+        let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..STREAM_NUM {
-            let stream = connector_a.connect().unwrap();
-            streams1.push(stream);
-        }
-        for _ in 0..STREAM_NUM {
-            let stream = acceptor_b.accept().await.unwrap();
-            streams2.push(stream);
-        }
-
-        let handles = streams1
-            .into_iter()
-            .zip(streams2.into_iter())
-            .map(|(a, b)| {
-                tokio::spawn(async move {
-                    test_stream(a, b).await;
-                })
-            })
-            .collect::<Vec<_>>();
-
-        for h in handles {
-            h.await.unwrap();
+            let stream_a = mux_a.connect().unwrap();
+            let stream_b = mux_b.accept().await.unwrap();
+            tasks.spawn(async move {
+                test_stream(stream_a, stream_b).await;
+            });
         }
 
-        assert_eq!(connector_a.get_num_streams(), 0);
-        assert_eq!(connector_b.get_num_streams(), 0);
-        assert_eq!(acceptor_a.get_num_streams(), 0);
-        assert_eq!(acceptor_b.get_num_streams(), 0);
-    }
+        while let Some(task) = tasks.join_next().await {
+            task.unwrap();
+        }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_worker_drop() {
-        let (a, b) = get_tcp_pair().await;
-        let (connector_a, mut acceptor_a, worker_a) =
-            MuxBuilder::client().with_connection(a).build();
-        let (connector_b, mut acceptor_b, worker_b) =
-            MuxBuilder::server().with_connection(b).build();
-        let mut stream1 = connector_a.connect().unwrap();
-        let h1 = tokio::spawn(async move {
-            let mut buf = vec![0; 0x100];
-            stream1.read_exact(&mut buf).await.unwrap_err();
-        });
-
-        drop(worker_a);
-        drop(worker_b);
-
-        assert!(connector_a.connect().is_err());
-        assert!(connector_b.connect().is_err());
-        assert!(acceptor_a.accept().await.is_none());
-        assert!(acceptor_b.accept().await.is_none());
-        h1.await.unwrap();
+        assert_eq!(mux_a.get_num_channels(), 0);
+        assert_eq!(mux_b.get_num_channels(), 0);
     }
 
     #[tokio::test]
     async fn test_shutdown() {
         let (a, b) = get_tcp_pair().await;
-        let (connector_a, acceptor_a, worker_a) = MuxBuilder::client().with_connection(a).build();
-        let (connector_b, mut acceptor_b, worker_b) =
-            MuxBuilder::server().with_connection(b).build();
-        tokio::spawn(async move {
-            worker_a.await.unwrap();
-        });
-        tokio::spawn(async move {
-            worker_b.await.unwrap();
-        });
+        let mux_a = MuxBuilder::new_client().build(a).await;
+        let mut mux_b = MuxBuilder::new_server().build(b).await;
 
-        let mut stream1 = connector_a.connect().unwrap();
-        let mut stream2 = acceptor_b.accept().await.unwrap();
+        let mut stream1 = mux_a.connect().unwrap();
+        let mut stream2 = mux_b.accept().await.unwrap();
 
-        let data = [1, 2, 3, 4];
-        stream2.write_all(&data).await.unwrap();
+        let data_2_1 = [1, 2, 3, 4];
+        stream2.write_all(&data_2_1).await.unwrap();
         stream2.shutdown().await.unwrap();
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        stream1.write_all(&[0, 1, 2, 3]).await.unwrap_err();
-        stream1.flush().await.unwrap_err();
+        // stream2 down, write into stream1 should fail
+        let result = stream1.write_all(&[0, 1, 2, 3]).await;
+        assert!(result.is_err());
+        let result = stream1.flush().await;
+        assert!(result.is_err());
+        // reading the outstanding data still work
         let mut buf = vec![0; 4];
-        stream1.read_exact(&mut buf).await.unwrap();
-        assert!(buf == data);
-        stream1.read(&mut buf).await.unwrap_err();
+        let result = stream1.read_exact(&mut buf).await;
+        assert!(result.is_ok());
+        assert_eq!(buf, data_2_1);
+        // data drained, reading from stream2 should fail
+        let result = stream1.read(&mut buf).await;
+        assert!(result.is_err());
 
-        drop(acceptor_a);
-        let mut stream = connector_b.connect().unwrap();
+        let mut stream = mux_b.connect().unwrap();
+        mux_a.close().await.unwrap();
+
         stream.read(&mut buf).await.unwrap_err();
         stream.flush().await.unwrap_err();
-        stream.shutdown().await.unwrap();
-
-        let mut stream1 = connector_a.connect().unwrap();
-        let mut stream2 = acceptor_b.accept().await.unwrap();
-        stream1.write_all(&data).await.unwrap();
-        stream1.flush().await.unwrap();
-        drop(stream1);
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let mut buf = vec![0; 4];
-        stream2.read_exact(&mut buf).await.unwrap();
-        assert!(buf == data);
-        stream2.read_exact(&mut buf).await.unwrap_err();
-        stream2.write_all(&data).await.unwrap_err();
+        stream.shutdown().await.unwrap_err();
     }
 
     #[tokio::test]
     async fn test_timeout() {
-        let (a, b) = get_tcp_pair().await;
-        let (connector_a, _, worker_a) = MuxBuilder::client()
+        let (a, b) = duplex(1024);
+        let mux_a = MuxBuilder::new_client()
             .with_idle_timeout(NonZeroU64::new(3).unwrap())
-            .with_connection(a)
-            .build();
-        let (_, mut acceptor_b, worker_b) = MuxBuilder::server().with_connection(b).build();
-        tokio::spawn(async move {
-            worker_a.await.unwrap();
-        });
-        tokio::spawn(async move {
-            worker_b.await.unwrap();
-        });
+            .build(a)
+            .await;
+        let mut mux_b = MuxBuilder::new_server().build(b).await;
 
-        let mut stream1 = connector_a.connect().unwrap();
-        let mut stream2 = acceptor_b.accept().await.unwrap();
+        let mut stream1 = mux_a.connect().unwrap();
+        let mut stream2 = mux_b.accept().await.unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(!stream1.is_closed());
         assert!(!stream2.is_closed());
